@@ -145,12 +145,13 @@ CREATE TABLE feishu_tokens (
     id SERIAL PRIMARY KEY,
     user_id INTEGER REFERENCES admin_users(id) ON DELETE CASCADE,
     app_id VARCHAR(64) NOT NULL,
-    access_token TEXT NOT NULL,
-    refresh_token TEXT,
+    access_token_encrypted TEXT NOT NULL,  -- 加密存储的access token
+    refresh_token_encrypted TEXT,          -- 加密存储的refresh token
     expires_at TIMESTAMP NOT NULL,
     refresh_expires_at TIMESTAMP,
     token_type VARCHAR(20) DEFAULT 'Bearer',
     scope VARCHAR(200),
+    encryption_key_id VARCHAR(32) NOT NULL, -- 加密密钥ID，支持密钥轮换
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -173,6 +174,9 @@ import logging
 from datetime import datetime, timedelta
 from flask import current_app
 from typing import Optional, Dict, Any
+from cryptography.fernet import Fernet
+import os
+import base64
 
 from app.extensions import cache, db
 from app.models.user.admin import AdminUser
@@ -187,6 +191,79 @@ class FeishuAuthService:
     FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 
     @staticmethod
+    def _get_encryption_key() -> bytes:
+        """
+        获取令牌加密密钥
+
+        Returns:
+            bytes: 加密密钥
+        """
+        # 从环境变量或配置中获取密钥
+        key_b64 = current_app.config.get('FEISHU_TOKEN_ENCRYPTION_KEY')
+        if not key_b64:
+            # 如果没有配置密钥，生成一个新的（仅用于开发环境）
+            key = Fernet.generate_key()
+            current_app.logger.warning("No FEISHU_TOKEN_ENCRYPTION_KEY configured, using generated key")
+            return key
+
+        try:
+            return base64.urlsafe_b64decode(key_b64.encode())
+        except Exception:
+            # 如果密钥格式不正确，生成新的
+            key = Fernet.generate_key()
+            current_app.logger.error("Invalid FEISHU_TOKEN_ENCRYPTION_KEY format, using generated key")
+            return key
+
+    @staticmethod
+    def _encrypt_token(token: str) -> str:
+        """
+        加密令牌
+
+        Args:
+            token: 原始令牌
+
+        Returns:
+            str: 加密后的令牌
+        """
+        if not token:
+            return token
+
+        try:
+            key = FeishuAuthService._get_encryption_key()
+            fernet = Fernet(key)
+            encrypted = fernet.encrypt(token.encode())
+            return base64.urlsafe_b64encode(encrypted).decode()
+        except Exception as e:
+            current_app.logger.error(f"Failed to encrypt token: {str(e)}")
+            # 加密失败时记录错误但不中断流程
+            return token
+
+    @staticmethod
+    def _decrypt_token(encrypted_token: str) -> str:
+        """
+        解密令牌
+
+        Args:
+            encrypted_token: 加密的令牌
+
+        Returns:
+            str: 解密后的令牌
+        """
+        if not encrypted_token:
+            return encrypted_token
+
+        try:
+            key = FeishuAuthService._get_encryption_key()
+            fernet = Fernet(key)
+            decoded = base64.urlsafe_b64decode(encrypted_token.encode())
+            decrypted = fernet.decrypt(decoded)
+            return decrypted.decode()
+        except Exception as e:
+            current_app.logger.error(f"Failed to decrypt token: {str(e)}")
+            # 解密失败时返回原始值，可能是未加密的历史数据
+            return encrypted_token
+
+    @staticmethod
     def get_authorization_url(app_id: str, redirect_uri: str, state: str = None) -> str:
         """
         生成飞书授权URL
@@ -199,6 +276,8 @@ class FeishuAuthService:
         Returns:
             str: 授权URL
         """
+        from urllib.parse import urlencode
+
         params = {
             'app_id': app_id,
             'redirect_uri': redirect_uri,
@@ -208,7 +287,8 @@ class FeishuAuthService:
         if state:
             params['state'] = state
 
-        query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+        # 使用urlencode确保正确的URL编码
+        query_string = urlencode(params)
         return f"https://open.feishu.cn/open-apis/authen/v1/index?{query_string}"
 
     @staticmethod
@@ -333,14 +413,14 @@ class FeishuAuthService:
     @staticmethod
     def find_or_create_user(feishu_user_info: Dict[str, Any],
                            auto_create: bool = False,
-                           default_role_ids: list = None) -> Optional[AdminUser]:
+                           default_role_codes: list = None) -> Optional[AdminUser]:
         """
         查找或创建用户
 
         Args:
             feishu_user_info: 飞书用户信息
             auto_create: 是否自动创建用户
-            default_role_ids: 默认角色ID列表
+            default_role_codes: 默认角色代码列表
 
         Returns:
             AdminUser: 用户对象
@@ -370,7 +450,7 @@ class FeishuAuthService:
         # 如果仍然没找到且允许自动创建
         if not user and auto_create and email:
             user = FeishuAuthService._create_user_from_feishu(
-                feishu_user_info, default_role_ids
+                feishu_user_info, default_role_codes
             )
 
         # 更新用户飞书信息
@@ -381,13 +461,13 @@ class FeishuAuthService:
 
     @staticmethod
     def _create_user_from_feishu(feishu_user_info: Dict[str, Any],
-                                default_role_ids: list = None) -> AdminUser:
+                                default_role_codes: list = None) -> AdminUser:
         """
         从飞书信息创建用户
 
         Args:
             feishu_user_info: 飞书用户信息
-            default_role_ids: 默认角色ID列表
+            default_role_codes: 默认角色代码列表
 
         Returns:
             AdminUser: 新创建的用户
@@ -404,11 +484,18 @@ class FeishuAuthService:
                 username = f"{base_username}_{counter}"
                 counter += 1
 
+            # 为飞书用户生成随机密码hash，防止check_password_hash报错
+            import secrets
+            import string
+            from werkzeug.security import generate_password_hash
+
+            random_password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
+
             user = AdminUser(
                 username=username,
                 email=email or f"{username}@feishu.local",
                 full_name=feishu_user_info.get('name', username),
-                password_hash='',  # 飞书用户不需要密码
+                password_hash=generate_password_hash(random_password),  # 生成有效hash，但用户无法知道密码
                 is_active=True,
                 feishu_user_id=feishu_user_info.get('user_id'),
                 feishu_union_id=feishu_user_info.get('union_id'),
@@ -422,12 +509,16 @@ class FeishuAuthService:
             db.session.add(user)
             db.session.flush()  # 获取用户ID
 
-            # 分配默认角色
-            if default_role_ids:
-                from app.models.user.admin import UserRole
-                for role_id in default_role_ids:
-                    user_role = UserRole(user_id=user.id, role_id=role_id)
-                    db.session.add(user_role)
+            # 分配默认角色 - 将role codes转换为role IDs
+            if default_role_codes:
+                from app.models.user.admin import UserRole, Role
+                for role_code in default_role_codes:
+                    role = Role.query.filter_by(code=role_code).first()
+                    if role:
+                        user_role = UserRole(user_id=user.id, role_id=role.id)
+                        db.session.add(user_role)
+                    else:
+                        current_app.logger.warning(f"Role with code '{role_code}' not found")
 
             db.session.commit()
             current_app.logger.info(f"Created user from Feishu: {username}")
@@ -498,7 +589,7 @@ class FeishuAuthService:
             user = FeishuAuthService.find_or_create_user(
                 user_info,
                 app_config.get('auto_create_user', False),
-                app_config.get('default_role_ids', [])
+                app_config.get('default_role_codes', [])
             )
 
             if not user or not user.is_active:
@@ -538,12 +629,18 @@ class FeishuAuthService:
         """
         try:
             cache_key = f"feishu_user_token_{app_id}_{user_id}"
+
+            # 加密敏感令牌数据
+            encrypted_access_token = FeishuAuthService._encrypt_token(token_data.get('access_token'))
+            encrypted_refresh_token = FeishuAuthService._encrypt_token(token_data.get('refresh_token'))
+
             cache_data = {
-                'access_token': token_data.get('access_token'),
-                'refresh_token': token_data.get('refresh_token'),
+                'access_token_encrypted': encrypted_access_token,
+                'refresh_token_encrypted': encrypted_refresh_token,
                 'expires_in': token_data.get('expires_in'),
                 'refresh_expires_in': token_data.get('refresh_expires_in'),
-                'cached_at': datetime.utcnow().isoformat()
+                'cached_at': datetime.utcnow().isoformat(),
+                'encryption_key_id': 'default'  # 支持密钥轮换
             }
 
             # 缓存到令牌过期时间
@@ -571,8 +668,11 @@ class FeishuAuthService:
             cache_key = f"feishu_user_token_{app_id}_{user_id}"
             cached_data = cache.get(cache_key)
 
-            if not cached_data or not cached_data.get('refresh_token'):
+            if not cached_data or not cached_data.get('refresh_token_encrypted'):
                 return None
+
+            # 解密refresh token
+            refresh_token = FeishuAuthService._decrypt_token(cached_data.get('refresh_token_encrypted'))
 
             # 获取应用令牌
             app_token = FeishuAuthService.get_app_access_token(app_id, app_secret)
@@ -587,7 +687,7 @@ class FeishuAuthService:
             }
             data = {
                 'grant_type': 'refresh_token',
-                'refresh_token': cached_data['refresh_token']
+                'refresh_token': refresh_token
             }
 
             response = requests.post(url, json=data, headers=headers, timeout=10)
@@ -625,6 +725,47 @@ from app.utils.response import APIResponse
 from app.api.v1.auth.schema.auth import TokenResponseSchema
 
 
+def _validate_redirect_uri(redirect_uri: str, allowed_domains: list) -> bool:
+    """
+    验证redirect_uri是否在允许的域名列表中
+
+    Args:
+        redirect_uri: 回调地址
+        allowed_domains: 允许的域名列表
+
+    Returns:
+        bool: 是否验证通过
+    """
+    from urllib.parse import urlparse
+
+    if not redirect_uri:
+        return False
+
+    try:
+        parsed = urlparse(redirect_uri)
+
+        # 必须是HTTPS（生产环境）或HTTP localhost（开发环境）
+        if parsed.scheme not in ['https', 'http']:
+            return False
+
+        if parsed.scheme == 'http' and not parsed.hostname in ['localhost', '127.0.0.1']:
+            return False
+
+        # 如果配置了允许域名列表，检查域名
+        if allowed_domains:
+            hostname = parsed.hostname
+            for allowed_domain in allowed_domains:
+                if hostname == allowed_domain or hostname.endswith(f'.{allowed_domain}'):
+                    return True
+            return False
+
+        # 如果没有配置域名限制，允许localhost和127.0.0.1
+        return parsed.hostname in ['localhost', '127.0.0.1'] or parsed.hostname.endswith('.ngrok.io')
+
+    except Exception:
+        return False
+
+
 @bp.route('/authorize', methods=['GET'])
 def get_authorization_url():
     """获取飞书授权URL"""
@@ -643,6 +784,11 @@ def get_authorization_url():
 
         if not app_config:
             return APIResponse.error(message='Feishu app not configured', code=400)
+
+        # 验证redirect_uri防止开放重定向攻击
+        if not _validate_redirect_uri(redirect_uri, app_config.allowed_domains):
+            current_app.logger.warning(f"Invalid redirect_uri attempted: {redirect_uri}")
+            return APIResponse.error(message='Invalid redirect_uri', code=400)
 
         # 生成state参数防止CSRF攻击
         state = str(uuid.uuid4())
@@ -828,22 +974,22 @@ class FeishuAppConfig(db.Model, TimestampMixin):
     verification_token = Column(String(255), nullable=True)
     is_active = Column(Boolean, default=True)
     auto_create_user = Column(Boolean, default=False)
-    default_role_ids = Column(ARRAY(Integer), nullable=True)
+    default_role_codes = Column(ARRAY(Text), nullable=True)  # 改为存储role codes而不是IDs
     allowed_domains = Column(ARRAY(Text), nullable=True)
     webhook_url = Column(String(500), nullable=True)
 
     def to_dict(self) -> dict:
-        """转换为字典"""
+        """转换为字典（包含敏感信息，仅服务层内部使用）"""
         return {
             'id': self.id,
             'app_name': self.app_name,
             'app_id': self.app_id,
-            'app_secret': self.app_secret,  # 注意：生产环境中不应返回密钥
+            'app_secret': self.app_secret,
             'encrypt_key': self.encrypt_key,
             'verification_token': self.verification_token,
             'is_active': self.is_active,
             'auto_create_user': self.auto_create_user,
-            'default_role_ids': self.default_role_ids,
+            'default_role_codes': self.default_role_codes,
             'allowed_domains': self.allowed_domains,
             'webhook_url': self.webhook_url
         }
@@ -898,16 +1044,15 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
       // 构建回调URL
       const redirectUri = `${window.location.origin}/auth/feishu/callback`;
 
-      // 获取授权URL
-      const response = await fetch('/api/v1/feishu-auth/authorize', {
+      // 获取授权URL - 使用query parameters而不是body
+      const params = new URLSearchParams({
+        app: 'default',
+        redirect_uri: redirectUri
+      });
+
+      const response = await fetch(`/api/v1/feishu-auth/authorize?${params}`, {
         method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          app: 'default',
-          redirect_uri: redirectUri
-        })
+        credentials: 'include'  // 确保发送cookies用于session验证
       });
 
       const data = await response.json();
@@ -1021,6 +1166,7 @@ const FeishuCallback: React.FC = () => {
           headers: {
             'Content-Type': 'application/json',
           },
+          credentials: 'include',  // 确保发送cookies用于session验证
           body: JSON.stringify({ code, state })
         });
 
