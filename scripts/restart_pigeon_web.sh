@@ -203,7 +203,7 @@ else
     
     # Drop existing database
     print_info "Dropping database $DB_NAME if exists..."
-    if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $DB_NAME;"; then
+    if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 -v client_min_messages=error -q -c "DROP DATABASE IF EXISTS $DB_NAME;" >/dev/null; then
         print_error "Failed to drop database $DB_NAME"
         print_error "This usually means there are active connections to the database."
         print_error ""
@@ -238,7 +238,7 @@ print_info "$CURRENT_STEP..."
 # Create database
 CURRENT_STEP="Creating database $DB_NAME"
 print_info "$CURRENT_STEP..."
-if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 -c "CREATE DATABASE $DB_NAME;"; then
+if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres -v ON_ERROR_STOP=1 -v client_min_messages=error -q -c "CREATE DATABASE $DB_NAME;" >/dev/null; then
     print_error "Failed to create database $DB_NAME"
     print_error "This could indicate a PostgreSQL connection or permission issue."
     exit 1
@@ -255,7 +255,7 @@ if [ ! -f "$WEB_SQL" ]; then
     exit 1
 fi
 
-if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$WEB_SQL"; then
+if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -v client_min_messages=error -q -f "$WEB_SQL" >/dev/null; then
     print_error "Failed to execute pigeon_web.sql"
     print_error "Check the SQL file for syntax errors or database connection issues."
     exit 1
@@ -272,7 +272,7 @@ if [ ! -f "$INIT_SQL" ]; then
     exit 1
 fi
 
-if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$INIT_SQL"; then
+if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -v client_min_messages=error -q -f "$INIT_SQL" >/dev/null; then
     print_error "Failed to execute init-db.sql"
     print_error "Check the SQL file for syntax errors or database connection issues."
     exit 1
@@ -780,7 +780,7 @@ COMMIT;
 EOF
 
 print_info "$CURRENT_STEP..."
-if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$MOCK_DATA_FILE"; then
+if ! PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -v client_min_messages=error -q -f "$MOCK_DATA_FILE" >/dev/null; then
     print_error "Failed to insert mock data"
     print_error "Check the mock data SQL for syntax errors or constraint violations."
     # Clean up even on failure
@@ -798,12 +798,12 @@ print_info "Database setup completed! Statistics:"
 
 # Check statistics with proper error handling
 CURRENT_STEP="Querying database statistics"
-if ! ENTERPRISES_COUNT=$(PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -t -c "SELECT COUNT(*) FROM enterprises;" 2>/dev/null | xargs); then
+if ! ENTERPRISES_COUNT=$(PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -v client_min_messages=error -q -t -c "SELECT COUNT(*) FROM enterprises;" 2>/dev/null | xargs); then
     print_error "Failed to query enterprises count"
     exit 1
 fi
 
-if ! ACCOUNTS_COUNT=$(PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -t -c "SELECT COUNT(*) FROM accounts;" 2>/dev/null | xargs); then
+if ! ACCOUNTS_COUNT=$(PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -v client_min_messages=error -q -t -c "SELECT COUNT(*) FROM accounts;" 2>/dev/null | xargs); then
     print_error "Failed to query accounts count"
     exit 1
 fi
