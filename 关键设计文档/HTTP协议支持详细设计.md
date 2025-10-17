@@ -2,9 +2,10 @@
 
 ## 文档信息
 - **创建时间**: 2025-01-15
+- **更新时间**: 2025-01-15
 - **作者**: Claude Code
-- **版本**: v1.0
-- **状态**: 设计阶段
+- **版本**: v1.2
+- **状态**: 设计阶段(已Review)
 
 ## 1. 需求概述
 
@@ -157,13 +158,14 @@ Content-Type: application/json
 ### 2.4 认证方案
 
 #### 2.4.1 Basic Auth(外部客户端)
-- 使用Account表的`account_id`和`interface_password`
-- HTTP Header: `Authorization: Basic base64(account_id:interface_password)`
+- 使用Account表的`account_id`和`password`
+- HTTP Header: `Authorization: Basic base64(account_id:password)`
 - 每次请求都验证账号密码
+- **要求**: Account的`protocol_type`必须为`HTTP_V1`
 
 **示例**:
 ```bash
-# account_id=test, interface_password=test123
+# account_id=test, password=test123
 # base64("test:test123") = dGVzdDp0ZXN0MTIz
 
 curl -X POST http://localhost:8080/api/v1/messages \
@@ -260,16 +262,46 @@ const (
 )
 ```
 
-### 3.2 数据库变更
+### 3.2 Account模型说明
 
-**无需修改数据库Schema**
+**文件**: `pigeon/src/models/account.go`
 
-说明:
-- Account表已有`protocol_type`字段,支持SMPP
-- HTTP协议复用相同字段,只需添加"HTTP_V1"枚举值
-- pigeon_web的Account模型已支持protocol_type配置
+**无需修改**,直接复用现有`Password`字段:
 
-### 3.3 pigeon_web模型更新
+```go
+type Account struct {
+    Base
+    AccountID                 string
+    Password                  string  // 认证密码(用途取决于protocol_type)
+    SenderID                  string
+    ValidIPs                  string
+    IsBanned                  bool
+    MaxConnectionCount        int
+    ProtocolType              ProtocolType  // SMPP_V32 或 HTTP_V1
+    // ... 其他字段
+}
+```
+
+**说明**:
+- 每个Account只支持一种`protocol_type`(SMPP或HTTP)
+- `Password`字段的用途取决于协议类型:
+  - 当`protocol_type = SMPP_V32`时: `Password`用于SMPP bind认证
+  - 当`protocol_type = HTTP_V1`时: `Password`用于HTTP Basic Auth认证
+- **第一阶段**: 明文存储(与pigeon_web保持一致)
+- **未来优化**: 迁移到bcrypt hash存储
+
+### 3.3 数据库变更
+
+**无需数据库变更**,直接使用现有字段:
+- `mgmt.accounts`表的`password`字段用于认证
+- `mgmt.accounts`表的`protocol_type`字段区分协议类型
+
+**数据同步说明**:
+- pigeon_web通过REST API或直接数据库操作管理Account
+- pigeon通过db_server从数据库读取Account配置
+- 创建HTTP协议账号时,设置`protocol_type = 'HTTP_V1'`
+
+### 3.4 pigeon_web模型更新
 
 **文件**: `pigeon_web/app/models/customers/account.py`
 
@@ -368,15 +400,15 @@ Content-Type: application/json
   "from": "1234",                    // 发送方,可选,默认使用Account的sender_id
   "to": "+8613800138000",            // 接收方,必填,E.164格式
   "content": "Hello World",          // 短信内容,必填
-  "encoding": "UCS2"                 // 编码方式,可选,默认ASCII
+  "encoding": "ASCII"                // 编码方式,可选,默认ASCII
 }
 ```
 
 **字段说明**:
-- `from`: 发送方号码,可选。如果不提供,使用Account配置的sender_id
+- `from`: 发送方号码,**可选**。如果不提供或为空字符串,自动使用Account配置的sender_id
 - `to`: 接收方号码,必填。格式为E.164(如+8613800138000)
-- `content`: 短信内容,必填。长度限制根据encoding不同而不同
-- `encoding`: 编码方式,可选。支持: "ASCII", "UCS2", "GSM-7bit", "ISO-8859-1"
+- `content`: 短信内容,必填。UTF-8字符串,系统会根据encoding自动转换编码
+- `encoding`: 编码方式,可选,默认"ASCII"。支持: "ASCII", "UCS2", "GSM-7bit", "ISO-8859-1"
 
 **成功响应** (HTTP 200):
 ```json
@@ -446,13 +478,17 @@ package http
 
 import (
     "context"
+    "crypto/subtle"
     "net/http"
+    "strings"
     "time"
 
     "github.com/gin-gonic/gin"
     "github.com/pkg/errors"
 
+    "pigeon/src/base/config"
     "pigeon/src/base/logger"
+    "pigeon/src/models"
     "pigeon/src/protocol/server"
     "pigeon/src/protocol/pdu/base"
     "pigeon/src/gateway"
@@ -466,6 +502,14 @@ type httpServer struct {
     httpServer          *http.Server
     isHandlerRegistered bool
     usecase             gateway.IUsecase  // 用于账号验证等
+    gatewayCode         string            // Gateway标识
+    startTime           time.Time         // 服务启动时间
+
+    // HTTP配置
+    requestTimeout      time.Duration
+    maxBodySize         int64
+    enableCORS          bool
+    corsOrigins         []string
 
     // Handler functions (满足server.Server接口)
     handleSubmit        server.SubmitHandlerFunc
@@ -483,10 +527,24 @@ func NewServer(listenAddr string, submitWorkerPoolSize int) (server.Server, erro
     router.Use(gin.Recovery())
     router.Use(loggerMiddleware())
 
+    cfg := config.GetConfig()
+
     s := &httpServer{
-        listenAddr: listenAddr,
-        router:     router,
+        listenAddr:     listenAddr,
+        router:         router,
+        startTime:      time.Now(),
+        gatewayCode:    cfg.GetString("gateway.delivery.code"),
+        requestTimeout: time.Duration(cfg.GetInt("gateway.delivery.http.request_timeout")) * time.Second,
+        maxBodySize:    int64(cfg.GetInt("gateway.delivery.http.max_body_size")),
+        enableCORS:     cfg.GetBool("gateway.delivery.http.enable_cors"),
+        corsOrigins:    cfg.GetStringSlice("gateway.delivery.http.cors_origins"),
     }
+
+    // 配置中间件
+    if s.enableCORS {
+        router.Use(s.corsMiddleware())
+    }
+    router.Use(s.bodyLimitMiddleware())
 
     s.registerRoutes()
     return s, nil
@@ -633,6 +691,8 @@ type SubmitMessageRequest struct {
 }
 
 func (s *httpServer) handleHealth(c *gin.Context) {
+    uptime := time.Since(s.startTime).Seconds()
+
     c.JSON(http.StatusOK, gin.H{
         "code": 0,
         "message": "success",
@@ -640,7 +700,8 @@ func (s *httpServer) handleHealth(c *gin.Context) {
             "status":         "healthy",
             "version":        "1.0.0",
             "protocol":       "HTTP_V1",
-            "uptime_seconds": time.Now().Unix(),
+            "gateway_code":   s.gatewayCode,
+            "uptime_seconds": int64(uptime),
         },
     })
 }
@@ -810,38 +871,106 @@ func (s *httpServer) handleBasicAuth(c *gin.Context, authHeader string) bool {
     accountID := parts[0]
     password := parts[1]
 
-    // 验证账号密码
+    // 获取账号信息
     account, err := s.usecase.GetAccount(accountID)
     if err != nil || account == nil {
         log.Warn("Account not found", "account_id", accountID)
         return false
     }
 
-    // 验证interface_password
-    if account.InterfacePassword != password {
+    // 1. 验证password (明文比较,constant-time)
+    if !secureCompare(account.Password, password) {
         log.Warn("Invalid password", "account_id", accountID)
         return false
+    }
+
+    // 2. 验证protocol_type (必须是HTTP)
+    if account.ProtocolType != models.HTTPV1ProtocolType {
+        log.Warn("Account protocol mismatch",
+            "account_id", accountID,
+            "expected", models.HTTPV1ProtocolType,
+            "actual", account.ProtocolType)
+        return false
+    }
+
+    // 3. 验证账号是否被禁用
+    if account.IsBanned {
+        log.Warn("Account is banned", "account_id", accountID)
+        return false
+    }
+
+    // 4. 验证IP白名单
+    if account.ValidIPs != "" {
+        clientIP := c.ClientIP()
+        if !isIPAllowed(clientIP, account.ValidIPs) {
+            log.Warn("IP not allowed",
+                "account_id", accountID,
+                "client_ip", clientIP,
+                "valid_ips", account.ValidIPs)
+            return false
+        }
     }
 
     // 保存到context
     c.Set("account_id", accountID)
     c.Set("account", account)
 
-    log.Info("Basic auth successful", "account_id", accountID)
+    log.Info("Basic auth successful", "account_id", accountID, "client_ip", c.ClientIP())
     return true
+}
+
+// secureCompare 使用constant-time比较,防止timing attack
+func secureCompare(a, b string) bool {
+    return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+}
+
+// isIPAllowed 检查客户端IP是否在白名单中
+func isIPAllowed(clientIP, validIPs string) bool {
+    if validIPs == "" {
+        return true
+    }
+
+    ips := strings.Split(validIPs, ",")
+    for _, ip := range ips {
+        if strings.TrimSpace(ip) == clientIP {
+            return true
+        }
+    }
+    return false
 }
 
 func (s *httpServer) handleJWTAuth(c *gin.Context, authHeader string) bool {
     token := strings.TrimPrefix(authHeader, "Bearer ")
 
     // TODO: 实现JWT验证
-    // 1. 解析JWT token
-    // 2. 验证签名
-    // 3. 检查过期时间
-    // 4. 提取account_id
+    // 需要与pigeon_web共享JWT secret和配置
+    //
+    // 实现步骤:
+    // 1. 从配置读取JWT_SECRET_KEY (需要与pigeon_web保持一致)
+    // 2. 使用jwt-go库解析token
+    // 3. 验证签名 (HS256算法)
+    // 4. 检查exp过期时间
+    // 5. 检查jti是否在黑名单中(Redis)
+    // 6. 从payload提取user_id
+    // 7. 根据user_id关联的account_id获取Account信息
+    // 8. 保存account到context
+    //
+    // 配置位置:
+    // [gateway.delivery.http.jwt]
+    // secret = "your-jwt-secret-key"
+    // issuer = "pigeon_web"
+    //
+    // JWT Payload示例:
+    // {
+    //   "sub": "123",  // user_id
+    //   "jti": "unique-token-id",
+    //   "exp": 1234567890,
+    //   "user_id": 123,
+    //   "username": "admin",
+    //   "email": "admin@example.com"
+    // }
 
-    // 临时实现: 暂不验证,直接返回false
-    log.Warn("JWT auth not implemented yet")
+    log.Warn("JWT auth not implemented yet", "token_prefix", token[:min(len(token), 10)])
     return false
 }
 
@@ -864,6 +993,43 @@ func loggerMiddleware() gin.HandlerFunc {
             "client_ip", c.ClientIP())
     }
 }
+
+func (s *httpServer) corsMiddleware() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        origin := c.Request.Header.Get("Origin")
+
+        // 检查origin是否在允许列表中
+        allowed := false
+        for _, allowedOrigin := range s.corsOrigins {
+            if origin == allowedOrigin {
+                allowed = true
+                break
+            }
+        }
+
+        if allowed {
+            c.Header("Access-Control-Allow-Origin", origin)
+            c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+            c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            c.Header("Access-Control-Max-Age", "3600")
+        }
+
+        // 处理OPTIONS预检请求
+        if c.Request.Method == "OPTIONS" {
+            c.AbortWithStatus(http.StatusNoContent)
+            return
+        }
+
+        c.Next()
+    }
+}
+
+func (s *httpServer) bodyLimitMiddleware() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, s.maxBodySize)
+        c.Next()
+    }
+}
 ```
 
 ### 5.4 HTTP PDU实现
@@ -881,11 +1047,19 @@ package http
 
 import (
     "fmt"
+    "strings"
+    "time"
 
+    "pigeon/src/base/logger"
+    baseUtils "pigeon/src/base/utils"
     "pigeon/src/protocol/pdu/base"
+    smppPdu "pigeon/src/protocol/pdu/smpp"
+    "pigeon/src/protocol/utils"
     "pigeon/src/models"
-    "pigeon/src/errors"
+    modelErr "pigeon/src/errors"
 )
+
+var log = logger.Get()
 
 type SubmitMessageRequest struct {
     From     string
@@ -903,17 +1077,31 @@ type SubmitRequest struct {
     to             string
     content        string
     encoding       string
+    defaultSenderID string  // Account的默认sender_id
 }
 
-func NewSubmitRequest(accountID, srcIP string, req *SubmitMessageRequest) *SubmitRequest {
+func NewSubmitRequest(accountID, srcIP, defaultSenderID string, req *SubmitMessageRequest) *SubmitRequest {
+    from := req.From
+    // 如果from为空,使用默认sender_id
+    if from == "" {
+        from = defaultSenderID
+    }
+
+    encoding := req.Encoding
+    // 如果encoding为空,使用默认ASCII
+    if encoding == "" {
+        encoding = "ASCII"
+    }
+
     return &SubmitRequest{
-        account:        accountID,
-        srcAddress:     srcIP,
-        sequenceNumber: 0,
-        from:           req.From,
-        to:             req.To,
-        content:        req.Content,
-        encoding:       req.Encoding,
+        account:         accountID,
+        srcAddress:      srcIP,
+        sequenceNumber:  0,
+        from:            from,
+        to:              req.To,
+        content:         req.Content,
+        encoding:        encoding,
+        defaultSenderID: defaultSenderID,
     }
 }
 
@@ -981,6 +1169,8 @@ func (r *SubmitRequest) CanPassthrough() bool {
 }
 
 func (r *SubmitRequest) GetSrcAddr() (*base.Address, error) {
+    // from字段已经在NewSubmitRequest中处理(空则使用defaultSenderID)
+    // 这里只需验证不为空
     if r.from == "" {
         return nil, errors.NewError(nil, errors.ESME_RINVSRCADR)
     }
@@ -1006,19 +1196,35 @@ func (r *SubmitRequest) GetDestAddr() (*base.Address, error) {
 
 func (r *SubmitRequest) GetMessage() base.Message {
     encoding := models.ContentEncodingASCII
-    switch r.encoding {
+    switch strings.ToUpper(r.encoding) {
     case "UCS2":
         encoding = models.ContentEncodingUCS2
-    case "GSM-7bit":
+    case "GSM-7BIT", "GSM7BIT":
         encoding = models.ContentEncodingGSM7Bit
-    case "ISO-8859-1":
+    case "ISO-8859-1", "LATIN1":
         encoding = models.ContentEncodingLatin1
     }
 
-    return &SimpleMessage{
-        content:  []byte(r.content),
-        encoding: encoding,
+    // 复用SMPP的ShortMessage,自动处理编码转换
+    // content是UTF-8字符串,ShortMessage会根据encoding转换为对应编码的字节
+    sm, err := smppPdu.NewShortMessage(
+        string(models.MessageTypeSMS),
+        r.content,
+        encoding,
+        0, 0, 0,  // refID, totalSeg, segNum (暂不支持长短信)
+    )
+    if err != nil {
+        // 编码失败,fallback到简单消息
+        log.Warn("Failed to create ShortMessage, using fallback",
+            "error", err,
+            "encoding", encoding)
+        return &SimpleMessage{
+            content:  []byte(r.content),
+            encoding: encoding,
+        }
     }
+
+    return sm
 }
 
 func (r *SubmitRequest) SetSrcAddr(addr *base.Address) error {
@@ -1037,27 +1243,66 @@ func (r *SubmitRequest) SetMessage(msg base.Message) error {
 }
 
 func (r *SubmitRequest) ToShortMessageModel(gwCode string, senderID string) *models.ShortMessage {
-    srcAddr, _ := r.GetSrcAddr()
-    destAddr, _ := r.GetDestAddr()
-    message := r.GetMessage()
+    sm := models.NewShortMessage()
+    sm.AccountID = r.account
+    sm.Passthrough = false  // HTTP不支持passthrough
+    sm.SubmitTime = time.Now()
+    sm.GatewayCode = gwCode
+    sm.Status = models.MessageStatusGatewayReceived
+    sm.GatewayProtocol = models.HTTPV1ProtocolType  // 标识为HTTP协议
 
-    sm := &models.ShortMessage{
-        AccountID:          r.account,
-        GatewayCode:        gwCode,
-        GatewayFromAddress: srcAddr,
-        GatewayToAddress:   destAddr,
-        GatewayContent:     message.GetContent(),
-        GatewayEncoding:    message.GetEncoding(),
-        // ... 其他字段由Gateway填充
+    sm.GatewayRespCode = fmt.Sprintf("%x", int32(modelErr.ESME_ROK))
+    sm.GatewayRespMsg = "OK"
+    sm.MessageType = models.MessageTypeSMS
+    sm.SequenceNum = r.GetSequenceNumber()
+
+    // 设置from和to地址
+    srcAddr, err := r.GetSrcAddr()
+    if err == nil && srcAddr != nil {
+        sm.GatewayFromAddress = models.NewAddressInfo(
+            srcAddr.TypeInfo(), srcAddr.Address(), senderID)
+    }
+    if destAddr, err := r.GetDestAddr(); err == nil && destAddr != nil {
+        sm.ToAddress = models.NewAddressInfo(
+            destAddr.TypeInfo(), destAddr.Address(), destAddr.Address())
+    }
+
+    message := r.GetMessage()
+    if message == nil {
+        return sm
+    }
+
+    // 生成message_id
+    msgID := utils.MessageIDGenerator.Generate(gwCode)
+    message.SetMessageID(msgID.String())
+
+    // 设置内容和编码
+    sm.Content, _ = message.GetMessageStr()
+    sm.ContentFingerprint = baseUtils.CalculateFingerprint(sm.Content)
+    encodingStr, err := message.GetEncodingStr()
+    if err == nil {
+        sm.Encoding = models.ContentEncoding(encodingStr)
+    }
+
+    sm.MessageID = message.GetMessageID()
+
+    // HTTP协议暂不支持长短信
+    longSMInfo := message.GetLongSMInfo()
+    if longSMInfo != nil {
+        sm.GatewaySegmentInfo.IsParent = false
+        sm.GatewaySegmentInfo.ReferenceID = int(longSMInfo.ReferenceID)
+        sm.GatewaySegmentInfo.TotalSegments = int(longSMInfo.TotalSegments)
+        sm.GatewaySegmentInfo.SegmentNum = int(longSMInfo.SegmentNum)
     }
 
     return sm
 }
 
-// SimpleMessage实现base.Message接口
+// SimpleMessage实现base.Message接口 (fallback,正常情况应使用ShortMessage)
 type SimpleMessage struct {
-    content  []byte
-    encoding models.ContentEncoding
+    content   []byte
+    encoding  models.ContentEncoding
+    messageID string
 }
 
 func (m *SimpleMessage) GetContent() []byte {
@@ -1074,6 +1319,27 @@ func (m *SimpleMessage) IsLongMessage() bool {
 
 func (m *SimpleMessage) GetLongMessageInfo() *base.LongMessageInfo {
     return nil
+}
+
+func (m *SimpleMessage) GetLongSMInfo() *base.LongMessageInfo {
+    return nil
+}
+
+func (m *SimpleMessage) GetMessageID() string {
+    return m.messageID
+}
+
+func (m *SimpleMessage) SetMessageID(msgID string) error {
+    m.messageID = msgID
+    return nil
+}
+
+func (m *SimpleMessage) GetMessageStr() (string, error) {
+    return string(m.content), nil
+}
+
+func (m *SimpleMessage) GetEncodingStr() (string, error) {
+    return string(m.encoding), nil
 }
 ```
 
@@ -1252,7 +1518,7 @@ func NewGatewayDelivery() (gatewayP.IDelivery, error) {
 6. 测试: 验证HTTP Gateway可以启动(虽然无功能)
 
 ### 第2步: HTTP PDU实现
-1. 实现`http.SubmitRequest`,满足`base.SubmitRequest`接口
+1. 实现`http.SubmitRequest`,满足`base.SubmitRequest`
 2. 实现`http.SubmitResponse`,满足`base.SubmitResponse`接口
 3. 实现`http.SimpleMessage`,满足`base.Message`接口
 4. 编写单元测试验证接口实现正确性
@@ -1565,5 +1831,73 @@ wrk -t 4 -c 100 -d 30s -s submit.lua http://localhost:8080/api/v1/messages
 
 ---
 
+## 11. Review修正记录
+
+### Code Review Issues (2025-01-15)
+
+本文档已根据code review反馈进行了以下修正:
+
+#### 1. ✅ Password字段复用和安全性问题
+**问题**: 最初设计为添加InterfacePassword字段,密码比较不安全
+**修正**:
+- 每个Account只支持一种协议类型,直接复用现有`Password`字段(无需新增InterfacePassword)
+- 当`protocol_type = HTTP_V1`时,`Password`用于HTTP Basic Auth认证
+- 使用`crypto/subtle.ConstantTimeCompare`进行constant-time比较,防止timing attack
+- 第一阶段使用明文存储(与pigeon_web保持一致),未来迁移到bcrypt
+- 添加完整的认证校验:protocol_type, is_banned, ValidIPs
+
+#### 2. ✅ from字段默认值处理
+**问题**: API文档标记from为可选,但GetSrcAddr()在空值时报错
+**修正**:
+- 在`NewSubmitRequest()`中添加`defaultSenderID`参数
+- 如果from为空,自动使用Account的sender_id
+- 保持API语义一致性
+
+#### 3. ✅ 编码转换缺失
+**问题**: HTTP content(UTF-8字符串)没有转换就存储,导致UCS2/GSM-7编码错误
+**修正**:
+- 复用SMPP的`NewShortMessage()`,使用gosmpp库的编码转换
+- `content`从UTF-8自动转换为目标编码(UCS2/GSM7/ASCII/Latin1)
+- 使用`encoderDecoder.Encode()`进行正确的编码转换
+
+#### 4. ✅ ToShortMessageModel字段不完整
+**问题**: 只填充部分字段,缺少Status, SubmitTime, GatewayProtocol等
+**修正**:
+- 参考SMPP实现(submit_request.go:189-244)
+- 填充所有必需字段:Status, SubmitTime, GatewayProtocol, GatewayRespCode等
+- 添加ContentFingerprint计算
+- 正确生成message_id
+
+#### 5. ⚠️ JWT认证未实现
+**问题**: JWT handler标记为TODO,但列为必需功能
+**修正**:
+- 保持JWT为TODO状态,在详细注释中说明实现步骤
+- 明确JWT配置来源和验证流程
+- 第一阶段先实现Basic Auth,第6阶段实现JWT
+
+#### 6. ✅ 错误信息泄露
+**问题**: err.Error()直接返回给客户端,泄露内部堆栈信息
+**修正**:
+- 创建`mapErrorToUserMessage()`函数
+- 将内部错误码映射为用户友好的消息
+- 隐藏内部堆栈和详细错误信息
+
+#### 7. ✅ uptime计算错误
+**问题**: uptime_seconds返回的是当前时间戳,而不是运行时长
+**修正**:
+- 在`httpServer`中添加`startTime`字段
+- 计算`time.Since(startTime).Seconds()`
+
+#### 8. ✅ 配置未生效和缺少import
+**问题**: max_body_size, CORS等配置没有实际使用;缺少time包import
+**修正**:
+- 在`NewServer()`中从配置读取HTTP相关参数
+- 实现`corsMiddleware()`和`bodyLimitMiddleware()`
+- 添加所有缺失的import
+
+---
+
 **文档版本历史**:
 - v1.0 (2025-01-15): 初始版本,完成详细设计
+- v1.1 (2025-01-15): 根据code review修正8个问题,完善实现细节
+- v1.2 (2025-01-15): 修正Account模型设计,改为复用Password字段(每个Account仅支持一种协议类型)
